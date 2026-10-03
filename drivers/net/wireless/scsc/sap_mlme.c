@@ -35,9 +35,6 @@ static struct sap_api sap_mlme = {
 static int sap_mlme_notifier(struct slsi_dev *sdev, unsigned long event)
 {
 	int i;
-#if defined(CONFIG_SLSI_WLAN_STA_FWD_BEACON) && (defined(SCSC_SEP_VERSION) && SCSC_SEP_VERSION >= 10)
-	struct net_device *dev;
-#endif
 	int level;
 	struct netdev_vif *ndev_vif;
 	bool is_recovery = false;
@@ -115,6 +112,7 @@ static int sap_mlme_notifier(struct slsi_dev *sdev, unsigned long event)
 
 	case SCSC_WIFI_RESUME:
 #if defined(CONFIG_SLSI_WLAN_STA_FWD_BEACON) && (defined(SCSC_SEP_VERSION) && SCSC_SEP_VERSION >= 10)
+#if 0
 		dev = slsi_get_netdev(sdev, SLSI_NET_INDEX_WLAN);
 		ndev_vif = netdev_priv(dev);
 		SLSI_MUTEX_LOCK(ndev_vif->vif_mutex);
@@ -130,6 +128,7 @@ static int sap_mlme_notifier(struct slsi_dev *sdev, unsigned long event)
 		}
 
 		SLSI_MUTEX_UNLOCK(ndev_vif->vif_mutex);
+#endif
 #endif
 		SLSI_MUTEX_LOCK(sdev->device_config_mutex);
 		if (!(sdev->device_config.user_suspend_mode) || (sdev->device_config.host_state & SLSI_HOSTSTATE_LCD_ACTIVE)) {
