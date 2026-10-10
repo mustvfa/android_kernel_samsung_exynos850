@@ -1,0 +1,259 @@
+name: build a kernel for a21s
+
+on:
+  schedule:
+    - cron: "0 1 * * 6"
+
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Create a GitHub Release after the build
+        type: boolean
+        required: true
+        default: true
+
+      changelog:
+        description: Optional release notes
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a-kernel-for-a21s
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Update BakaSU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    outputs:
+      commit_sha: ${{ steps.sync.outputs.commit_sha }}
+      bakasu_sha: ${{ steps.sync.outputs.bakasu_sha }}
+
+    steps:
+      - name: Checkout rooted branch
+        uses: actions/checkout@v4
+        with:
+          ref: rooted
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update BakaSU
+        id: sync
+        run: |
+          set -euo pipefail
+
+          git submodule sync -- KernelSU
+          git submodule update --init KernelSU
+
+          git -C KernelSU fetch --no-tags origin main
+          git -C KernelSU checkout --detach FETCH_HEAD
+
+          git add KernelSU
+
+          if ! git diff --cached --quiet; then
+            git commit -m "KernelSU: update BakaSU"
+          fi
+
+          git push origin HEAD:rooted
+
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "bakasu_sha=$(git -C KernelSU rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build Kernel
+    needs: sync
+
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    outputs:
+      zip_name: ${{ steps.package.outputs.zip_name }}
+
+    steps:
+      - name: Checkout synced commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit_sha }}
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            cpio \
+            flex \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lz4 \
+            perl \
+            python3 \
+            rsync \
+            unzip \
+            zip \
+            zstd
+
+      - name: Cache Android Clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/clang-r547379
+          key: android-clang-r547379-linux-x86-v2
+
+      - name: Download Android Clang r547379
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          mkdir -p toolchains/clang-r547379
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --connect-timeout 30 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r547379.tar.gz" \
+            | tar -xz -C toolchains/clang-r547379
+
+          test -x toolchains/clang-r547379/bin/clang
+ 
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang-r547379/bin:$PATH"
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+
+          mkdir -p out
+
+          make ARCH=arm64 O=out CC=clang exynos850-a21snsxx_defconfig
+          make ARCH=arm64 O=out CC=clang -j"$(nproc)"
+
+      - name: Create AnyKernel3 package
+        id: package
+        run: |
+          set -euo pipefail
+
+          AK_DIR="$RUNNER_TEMP/anykernel-a21s"
+
+          mkdir -p "$AK_DIR"
+
+          unzip -q packaging/Anykernel3-a21s.zip -d "$AK_DIR"
+
+          cp out/arch/arm64/boot/Image "$AK_DIR/Image"
+
+          rm -f \
+            "$AK_DIR/META-INF/MANIFEST.MF" \
+            "$AK_DIR/META-INF/CERT.SF" \
+            "$AK_DIR/META-INF/CERT.RSA"
+
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+          ZIP_NAME="a-kernel-for-a21s-${BUILD_DATE}.zip"
+
+          (
+            cd "$AK_DIR"
+            zip -qr "$GITHUB_WORKSPACE/$ZIP_NAME" .
+          )
+
+          test -f "$GITHUB_WORKSPACE/$ZIP_NAME"
+
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload kernel package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-package
+          path: ${{ steps.package.outputs.zip_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release
+
+    if: github.event_name == 'schedule' || inputs.publish_release == true
+
+    needs:
+      - sync
+      - build
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download kernel package
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-package
+          path: artifacts
+
+      - name: Verify package
+        run: |
+          ls -lah artifacts
+          test -f "artifacts/${{ needs.build.outputs.zip_name }}"
+
+      - name: Generate release info
+        id: release-info
+        env:
+          SOURCE_SHA: ${{ needs.sync.outputs.commit_sha }}
+          BAKASU_SHA: ${{ needs.sync.outputs.bakasu_sha }}
+          CHANGELOG: ${{ inputs.changelog }}
+          REPOSITORY: ${{ github.repository }}
+
+        run: |
+          set -euo pipefail
+
+          TAG="a-kernel-for-a21s-$(date -u +%Y%m%d-%H%M%S)-${SOURCE_SHA:0:7}"
+
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Build Information"
+            echo
+            echo "- BakaSU: \`${BAKASU_SHA}\`"
+            echo "- Source Commit: \`${SOURCE_SHA}\`"
+            echo "- Source Tree: https://github.com/${REPOSITORY}/tree/${SOURCE_SHA}"
+
+            if [ -n "${CHANGELOG}" ]; then
+              echo
+              echo "## Changelog"
+              echo
+              echo "${CHANGELOG}"
+            fi
+          } > release-notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-info.outputs.tag_name }}
+          name: ${{ steps.release-info.outputs.tag_name }}
+          target_commitish: ${{ needs.sync.outputs.commit_sha }}
+          body_path: release-notes.md
+          files: artifacts/${{ needs.build.outputs.zip_name }}
+          fail_on_unmatched_files: true
+          make_latest: true
